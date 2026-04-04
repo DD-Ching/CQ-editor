@@ -94,9 +94,8 @@ show_object(result)
     assert "rarrayx1" in audit["ops"]
 
 
-def test_native_feature_audit_blocks_manual_pattern_script(panel):
+def test_native_feature_audit_warns_on_manual_pattern_script(panel):
     panel._last_prompt_text = "Create a symmetric bracket with a 2x2 bolt pattern."
-    panel.iterations_spin = DummyValue(3)
     script = """import cadquery as cq
 parts = []
 for x in (-20, -10, 0, 10, 20):
@@ -110,10 +109,10 @@ show_object(result)
 
     audit = panel._audit_script(script)
 
-    assert audit["passed"] is False
+    assert audit["passed"] is True
     assert audit["score"] < 70
-    assert any("mirror primitive" in blocker for blocker in audit["blockers"])
-    assert any("array primitive" in blocker for blocker in audit["blockers"])
+    assert any("mirror primitive" in warning for warning in audit["warnings"])
+    assert any("array primitive" in warning for warning in audit["warnings"])
 
 
 def test_build_validation_detects_invalid_script(panel):
@@ -161,14 +160,14 @@ def test_sections_start_collapsed_and_can_expand():
 
 
 def test_failure_lines_include_stage_hint_and_cli_tail(panel):
-    panel._active_stage = {"task_id": "modeler", "effort": "medium"}
+    panel._active_stage = {"task_id": "codex", "effort": "medium"}
     panel._codex_event_summaries = ["CLI: turn started"]
     panel._codex_stderr = ["INFO: starting\n", "ERROR: request timed out upstream\n"]
 
     lines = panel._failure_lines("Generation timed out after 90s.", timed_out=True)
 
     assert any("Problem: Generation timed out after 90s." in line for line in lines)
-    assert any("Stage: Draft model (medium)" in line for line in lines)
+    assert any("Stage: Codex CLI (medium)" in line for line in lines)
     assert any("Iterations = 1" in line for line in lines)
     assert any("CLI tail:" in line and "request timed out upstream" in line for line in lines)
 
@@ -224,50 +223,42 @@ def test_codex_timeout_scales_with_effort():
     assert panel._codex_timeout_ms() == 210000
 
 
-def test_stage_plan_uses_single_modeler_pass_by_default(panel):
-    panel.worker_effort = DummyValue("medium")
+def test_stage_plan_uses_single_codex_pass_by_default(panel):
     panel.planner_effort = DummyValue("xhigh")
     panel.iterations_spin = DummyValue(1)
     panel.mode_combo = DummyValue("new")
 
     stages = panel._build_stage_plan()
 
-    assert [stage["task_id"] for stage in stages] == ["modeler"]
-    assert [stage["effort"] for stage in stages] == ["medium"]
+    assert [stage["task_id"] for stage in stages] == ["codex"]
+    assert [stage["effort"] for stage in stages] == ["xhigh"]
 
 
-def test_stage_plan_uses_worker_then_high_then_xhigh(panel):
-    panel.worker_effort = DummyValue("medium")
+def test_stage_plan_ignores_iterations_and_workers(panel):
+    panel.worker_effort = DummyValue("low")
     panel.planner_effort = DummyValue("xhigh")
     panel.iterations_spin = DummyValue(3)
     panel.mode_combo = DummyValue("new")
 
     stages = panel._build_stage_plan()
 
-    assert [stage["task_id"] for stage in stages] == ["modeler", "review_1", "review_2"]
-    assert [stage["effort"] for stage in stages] == ["medium", "high", "xhigh"]
+    assert [stage["task_id"] for stage in stages] == ["codex"]
+    assert [stage["effort"] for stage in stages] == ["xhigh"]
 
 
-def test_review_stage_prompt_contains_audit_feedback(panel):
-    panel.prompt = DummyValue("Create a symmetric bracket with a 2x2 bolt pattern.")
+def test_build_stage_prompt_uses_single_cli_prompt(panel):
+    panel.prompt = DummyValue("Draw a gear.")
     panel.mode_combo = DummyValue("new")
+    panel.planner_effort = DummyValue("high")
+    panel.lean_tokens = SimpleNamespace(isChecked=lambda: True)
     stage = {
-        "task_id": "review_1",
-        "kind": "review",
+        "task_id": "codex",
+        "kind": "new",
         "effort": "high",
-        "review_index": 1,
-        "review_total": 2,
     }
-    script = """import cadquery as cq
-parts = []
-for x in (-20, -10, 0, 10, 20):
-    parts.append(cq.Workplane("XY").box(5, 5, 5).translate((x, 0, 0)).val())
-result = cq.Workplane("XY").add(cq.Compound.makeCompound(parts))
-show_object(result)
-"""
 
-    prompt = panel._build_stage_prompt(stage, script)
+    prompt = panel._build_stage_prompt(stage, "")
 
-    assert "Native score:" in prompt
-    assert "Blockers:" in prompt
-    assert "mirror" in prompt.lower()
+    assert "Write one CadQuery Python script for CQ-editor." in prompt
+    assert "reasoning effort high" in prompt
+    assert "User request: Draw a gear." in prompt

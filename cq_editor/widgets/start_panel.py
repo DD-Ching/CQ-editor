@@ -127,11 +127,8 @@ class StartPanel(QWidget, ComponentMixin):
         self.mode_combo.addItem("Refine", "refine")
         self.mode_combo.addItem("Repair", "repair")
         self.iterations_spin = QSpinBox(self)
-        self.iterations_spin.setRange(1, 3)
+        self.iterations_spin.setRange(1, 1)
         self.iterations_spin.setValue(1)
-        self.iterations_spin.setToolTip(
-            "Total passes. 1 = fastest single draft, 2-3 enable staged review."
-        )
         self.lean_tokens = QCheckBox("Lean tokens", self)
         self.lean_tokens.setChecked(True)
         self.translate_button = QPushButton("中文", self)
@@ -157,12 +154,14 @@ class StartPanel(QWidget, ComponentMixin):
         self.strategy_widget = QWidget(self)
         strategy_row = QHBoxLayout(self.strategy_widget)
         strategy_row.setContentsMargins(0, 0, 0, 0)
-        self.planner_label = QLabel("Planner", self.strategy_widget)
+        self.planner_label = QLabel("Effort", self.strategy_widget)
         self.worker_label = QLabel("Workers", self.strategy_widget)
         strategy_row.addWidget(self.planner_label)
         strategy_row.addWidget(self.planner_effort)
-        strategy_row.addWidget(self.worker_label)
-        strategy_row.addWidget(self.worker_effort)
+        self.worker_label.hide()
+        self.worker_effort.hide()
+        self.iterations_label.hide()
+        self.iterations_spin.hide()
         self.task_tree = QTreeWidget(self)
         self.task_tree.setHeaderHidden(True)
         self.task_tree.setRootIsDecorated(False)
@@ -335,6 +334,7 @@ class StartPanel(QWidget, ComponentMixin):
             ("Mode", "模式"),
             ("Iterations", "迭代"),
             ("Planner", "規劃"),
+            ("Effort", "強度"),
             ("Workers", "執行"),
             ("Workflow", "工作流"),
             ("Show", "顯示"),
@@ -345,6 +345,7 @@ class StartPanel(QWidget, ComponentMixin):
             ("Supervisor", "監督者"),
             ("Draft model", "建模"),
             ("Review", "審查"),
+            ("Codex CLI", "Codex CLI"),
             ("CQ render", "CQ 渲染"),
             ("Repair path", "修錯路徑"),
             ("New Script", "新建腳本"),
@@ -584,7 +585,7 @@ class StartPanel(QWidget, ComponentMixin):
         self.title.setText(self._translate_text("Start a CAD script"))
         self.mode_label.setText(self._translate_text("Mode"))
         self.iterations_label.setText(self._translate_text("Iterations"))
-        self.planner_label.setText(self._translate_text("Planner"))
+        self.planner_label.setText(self._translate_text("Effort"))
         self.worker_label.setText(self._translate_text("Workers"))
         self.lean_tokens.setText(self._translate_text("Lean tokens"))
         self.translate_button.setText("EN" if self._is_zh() else "中文")
@@ -803,24 +804,21 @@ class StartPanel(QWidget, ComponentMixin):
         current_script = self._compact_script_context(
             self._main_window.components["editor"].toPlainText().strip()
         )
-        worker_effort = self.worker_effort.currentText()
         mode = self.mode_combo.currentData()
-        iterations = self.iterations_spin.value()
+        effort = self.planner_effort.currentText()
+        context_block = self._load_context_blocks()
         prompt_lines = [
-            "Write a single CadQuery Python script for CQ-editor.",
+            "Write one CadQuery Python script for CQ-editor.",
             "Return only raw Python code with no markdown fences or explanation.",
             "Use import cadquery as cq.",
             "Assign the final shape to result and call show_object(result).",
-            "Do deep planning first, then keep code edits compact and incremental.",
-            f"If you internally split work into smaller passes, keep worker effort at {worker_effort} or lower.",
-            f"Internally review and refine up to {iterations} pass(es) before finalizing.",
             "Prefer native CadQuery operations where applicable: extrude, revolve, loft, sweep, union, cut, hole, fillet, chamfer, mirrorX, mirrorY, rarray, parray.",
             "Avoid manually recreating repeated or symmetric geometry when a native mirror or pattern tool fits.",
             "At least 70% of repeated, symmetric, or patterned geometry must rely on native CadQuery feature operations instead of one-by-one placement.",
             "If symmetry is requested, use mirrorX or mirrorY unless there is a concrete reason not to.",
             "If a hole pattern or repeated feature is requested, use rarray or parray unless there is a concrete reason not to.",
-            "Add a compact comment header with PLAN:, NATIVE_OPS:, and CHECKS: before the modeling code.",
-            "In CHECKS, summarize proportion, symmetry, and front/side/top sanity checks without exposing hidden reasoning.",
+            f"Use reasoning effort {effort}, but produce one final script in one pass.",
+            "Add short PLAN:, NATIVE_OPS:, and CHECKS: comments when practical, but do not block yourself on formatting.",
         ]
 
         if self.lean_tokens.isChecked():
@@ -830,6 +828,9 @@ class StartPanel(QWidget, ComponentMixin):
                     "Prefer the smallest viable change instead of rewriting unrelated parts.",
                 )
             )
+
+        if context_block:
+            prompt_lines.extend(("Local agent context:", context_block, ""))
 
         if mode == "new":
             prompt_lines.append("Create a new model from scratch.")
@@ -994,10 +995,7 @@ class StartPanel(QWidget, ComponentMixin):
 
     def _history_title(self, status):
 
-        return (
-            f"Round {self._generation_round} · {self.mode_combo.itemText(self.mode_combo.currentIndex())} "
-            f"· x{self.iterations_spin.value()} · {self._translate_text(status)}"
-        )
+        return f"Round {self._generation_round} · {self.mode_combo.itemText(self.mode_combo.currentIndex())} · {self._translate_text(status)}"
 
     def _history_prompt_summary(self, prompt):
 
@@ -1019,8 +1017,7 @@ class StartPanel(QWidget, ComponentMixin):
             QTreeWidgetItem(
                 [
                     self._history_text(
-                        f"Strategy: planner {self.planner_effort.currentText()} · "
-                        f"workers {self.worker_effort.currentText()}"
+                        f"Strategy: single cli · effort {self.planner_effort.currentText()}"
                     )
                 ]
             )
@@ -1119,7 +1116,7 @@ class StartPanel(QWidget, ComponentMixin):
         requirements = self._intent_requirements(prompt_text)
         ops, warnings = self._inspect_script(script, prompt_text=prompt_text)
         blockers = []
-        strict_mode = self._review_stage_total() > 0
+        strict_mode = False
         enforce_native_gate = (
             requirements["mirror"] or requirements["pattern"] or weighted_manual >= 6
         )
@@ -1169,113 +1166,29 @@ class StartPanel(QWidget, ComponentMixin):
 
     def _review_stage_total(self):
 
-        return max(self._iterations_value() - 1, 0)
+        return 0
 
     def _stage_title(self, stage):
 
+        if stage["task_id"] == "codex":
+            return f"Codex CLI ({stage['effort']})"
         if stage["task_id"] == "modeler":
             return f"Draft model ({stage['effort']})"
         return f"Review {stage['review_index']} ({stage['effort']})"
 
     def _build_stage_plan(self):
 
-        mode = self.mode_combo.currentData()
-        stages = [
+        return [
             {
-                "task_id": "modeler",
-                "kind": mode if mode in ("refine", "repair") else "draft",
-                "effort": self.worker_effort.currentText(),
+                "task_id": "codex",
+                "kind": self.mode_combo.currentData(),
+                "effort": self.planner_effort.currentText(),
             }
         ]
-        review_total = self._review_stage_total()
-        for index in range(1, review_total + 1):
-            stages.append(
-                {
-                    "task_id": f"review_{index}",
-                    "kind": "review",
-                    "effort": self._planner_review_effort(index, review_total),
-                    "review_index": index,
-                    "review_total": review_total,
-                }
-            )
-        return stages
 
     def _build_stage_prompt(self, stage, script=""):
 
-        request = self.prompt.toPlainText().strip()
-        mode = self.mode_combo.currentData()
-        context_block = self._load_context_blocks()
-
-        if stage["task_id"] == "modeler":
-            prompt_lines = [
-                "You are the worker agent in a staged CAD pipeline.",
-                "Write a single CadQuery Python script for CQ-editor.",
-                "Return only raw Python code with no markdown fences or explanation.",
-                "Use import cadquery as cq.",
-                "Assign the final shape to result and call show_object(result).",
-                "Use CadQuery native features first: extrude, revolve, loft, sweep, union, cut, hole, fillet, chamfer, mirrorX, mirrorY, rarray, parray.",
-                "At least 70% of repeated, symmetric, or patterned geometry must use native CadQuery features rather than one-by-one placement.",
-                "Add a compact comment header with PLAN:, NATIVE_OPS:, and CHECKS: before the modeling code.",
-                "Keep the script compact. Do not include alternatives or long commentary.",
-            ]
-            if context_block:
-                prompt_lines.extend(("Local agent context:", context_block, ""))
-            if mode == "new":
-                prompt_lines.append("Task: create the first working draft from scratch.")
-            elif mode == "refine":
-                prompt_lines.extend(
-                    (
-                        "Task: refine the current CadQuery script with the smallest viable changes.",
-                        "",
-                        "Current script:",
-                        self._compact_script_context(
-                            self._main_window.components["editor"].toPlainText().strip()
-                        )
-                        or "# none",
-                    )
-                )
-            else:
-                prompt_lines.extend(
-                    (
-                        "Task: repair the current CadQuery script with the smallest viable changes.",
-                        "",
-                        "Current script:",
-                        self._compact_script_context(
-                            self._main_window.components["editor"].toPlainText().strip()
-                        )
-                        or "# none",
-                        "",
-                        "Current error:",
-                        self._last_traceback_text or "No traceback captured.",
-                    )
-                )
-            prompt_lines.extend(("", f"User request: {request}"))
-            return "\n".join(prompt_lines)
-
-        audit = self._audit_script(script, prompt_text=request)
-        prompt_lines = [
-            "You are the review/refinement agent in a staged CAD pipeline.",
-            "You must revise the supplied CadQuery script, not replace the design intent.",
-            "Return only raw Python code with no markdown fences or explanation.",
-            "Preserve import cadquery as cq, result, and show_object(result).",
-            "Use the audit summary to fix weak spots while keeping edits compact.",
-            "Prefer CadQuery native features over manual translate/loop/compound placement.",
-            "If symmetry is requested, use mirrorX or mirrorY where suitable.",
-            "If repeated holes or repeated features are requested, use rarray or parray where suitable.",
-            "Keep or improve the PLAN:, NATIVE_OPS:, and CHECKS: header.",
-            "",
-            f"Stage: review {stage['review_index']} of {stage['review_total']}",
-            f"User request: {request}",
-            f"Native score: {audit['score']}%",
-            "Warnings:",
-        ]
-        if context_block:
-            prompt_lines[0:0] = ["Local agent context:", context_block, ""]
-        prompt_lines.extend(f"- {message}" for message in audit["warnings"] or ["- none"])
-        prompt_lines.append("Blockers:")
-        prompt_lines.extend(f"- {message}" for message in audit["blockers"] or ["- none"])
-        prompt_lines.extend(("", "Current script:", script or "# none"))
-        return "\n".join(prompt_lines)
+        return self._build_codex_prompt()
 
     def _cleanup_output_path(self):
 
@@ -1294,10 +1207,9 @@ class StartPanel(QWidget, ComponentMixin):
         self._cleanup_output_path()
         self._codex_process = None
         self._pipeline_queue = []
-        self._set_task_status("supervisor", "error")
         if active_stage is not None:
             self._set_task_status(active_stage["task_id"], "error")
-        self._set_task_status("repair", "waiting")
+        self._set_task_status("renderer", "waiting")
         self._active_stage = None
         self._set_section_visible("workflow", True)
         self._set_section_visible("history", True)
@@ -1361,7 +1273,7 @@ class StartPanel(QWidget, ComponentMixin):
         self._set_text(
             "cli_label",
             self.cli_label,
-            f"Codex CLI: generating {self._stage_title(stage)}...",
+            f"Codex CLI: generating...",
         )
         estimated = self._estimate_tokens(prompt_text)
         self._set_usage_summary(
@@ -1378,35 +1290,16 @@ class StartPanel(QWidget, ComponentMixin):
         self._task_items = {}
         self._task_states = {}
 
-        supervisor = QTreeWidgetItem(
-            [self._translate_text(f"Supervisor ({self.planner_effort.currentText()}) · idle")]
+        codex = QTreeWidgetItem(
+            [self._translate_text(f"Codex CLI ({self.planner_effort.currentText()}) · idle")]
         )
-        self.task_tree.addTopLevelItem(supervisor)
-        self._task_items["supervisor"] = supervisor
-        self._task_states["supervisor"] = ("Supervisor", self.planner_effort.currentText(), "idle")
-
-        modeler = QTreeWidgetItem(
-            [self._translate_text(f"Draft model ({self.worker_effort.currentText()}) · waiting")]
-        )
-        supervisor.addChild(modeler)
-        self._task_items["modeler"] = modeler
-        self._task_states["modeler"] = ("Draft model", self.worker_effort.currentText(), "waiting")
-
-        for index in range(1, self._review_stage_total() + 1):
-            item = QTreeWidgetItem([self._translate_text(f"Review {index} ({self.planner_effort.currentText()}) · waiting")])
-            supervisor.addChild(item)
-            self._task_items[f"review_{index}"] = item
-            self._task_states[f"review_{index}"] = ("Review {}".format(index), self.planner_effort.currentText(), "waiting")
-
         renderer = QTreeWidgetItem([self._translate_text("CQ render · waiting")])
-        repair = QTreeWidgetItem([self._translate_text("Repair path · idle")])
-        supervisor.addChild(renderer)
-        supervisor.addChild(repair)
+        self.task_tree.addTopLevelItem(codex)
+        self.task_tree.addTopLevelItem(renderer)
+        self._task_items["codex"] = codex
         self._task_items["renderer"] = renderer
-        self._task_items["repair"] = repair
+        self._task_states["codex"] = ("Codex CLI", self.planner_effort.currentText(), "idle")
         self._task_states["renderer"] = ("CQ render", "", "waiting")
-        self._task_states["repair"] = ("Repair path", "", "idle")
-        supervisor.setExpanded(True)
 
     def _set_task_status(self, task_id, status):
 
@@ -1459,8 +1352,6 @@ class StartPanel(QWidget, ComponentMixin):
         if event == "start":
             self._set_section_visible("workflow", True)
             self._set_task_status("renderer", "running")
-            if self.mode_combo.currentData() == "repair":
-                self._set_task_status("repair", "running")
             total_nodes = state.get("total_nodes", 1)
             self._begin_activity(
                 "Render",
@@ -1496,8 +1387,6 @@ class StartPanel(QWidget, ComponentMixin):
                 f"viewer {state.get('viewer_apply_time_s', 0.0):.4f}s"
             )
             self._set_task_status("renderer", "done")
-            if self.mode_combo.currentData() == "repair":
-                self._set_task_status("repair", "done")
             self._finish_activity(f"Done ({mode})", detail)
             self._set_text(
                 "elapsed_label",
@@ -1507,7 +1396,6 @@ class StartPanel(QWidget, ComponentMixin):
         elif event == "error":
             self._set_section_visible("workflow", True)
             self._set_task_status("renderer", "error")
-            self._set_task_status("repair", "waiting")
             self._show_failure(state.get("message", "unknown error"))
             self._set_text("status_label", self.status_label, f"Status: {mode} failed")
             self._set_text("detail_label", self.detail_label, f"Stage: {state.get('message', 'unknown error')}")
@@ -1527,7 +1415,6 @@ class StartPanel(QWidget, ComponentMixin):
         self._last_traceback_text = f"{exc_type.__name__}: {exc}"
         self._set_section_visible("workflow", True)
         self._set_task_status("renderer", "error")
-        self._set_task_status("repair", "waiting")
         self._show_failure(self._last_traceback_text)
         self._set_text("status_label", self.status_label, "Status: Render failed")
         self._set_text("detail_label", self.detail_label, f"Stage: {exc_type.__name__}: {exc}")
@@ -1626,13 +1513,10 @@ class StartPanel(QWidget, ComponentMixin):
         self._start_history_entry()
         self._add_history_line(f"Context: {self._context_summary()}")
         self._set_section_visible("workflow", True)
-        self._set_task_status("supervisor", "running")
-        self._set_task_status("modeler", "waiting")
-        self._set_review_states("waiting")
+        self._set_task_status("codex", "running")
         self._set_task_status("renderer", "waiting")
-        self._set_task_status("repair", "idle")
         self._set_generating(True)
-        self._set_text("cli_label", self.cli_label, "Codex CLI: staged generation running...")
+        self._set_text("cli_label", self.cli_label, "Codex CLI: generating...")
         self._set_usage_summary(input_tokens=0, cached_tokens=0, output_tokens=0)
         info("Codex generation started")
         self._launch_stage(self._pipeline_queue.pop(0))
@@ -1700,10 +1584,6 @@ class StartPanel(QWidget, ComponentMixin):
 
         self._pipeline_script = generated
 
-        if self._pipeline_queue:
-            self._launch_stage(self._pipeline_queue.pop(0))
-            return
-
         audit = self._audit_script(generated)
         header = self._extract_script_header(generated)
         for line in header:
@@ -1720,35 +1600,25 @@ class StartPanel(QWidget, ComponentMixin):
         build_ok, build_error = self._validate_script_build(generated)
         if not build_ok:
             self._add_history_line(f"Build failed: {build_error}")
-            self._set_review_states("error")
-            self._fail_pipeline(
-                f"build validation failed: {build_error}",
-                history_detail="build validation failed",
-            )
-            return
-
-        if not audit["passed"]:
-            self._set_review_states("error")
-            self._fail_pipeline(
-                f"native feature gate blocked at {audit['score']}%",
-                history_detail="native feature gate blocked",
-            )
-            return
+        if audit["blockers"]:
+            for message in audit["blockers"]:
+                self._add_history_line(f"Warnings: {message}")
 
         self._set_generating(False)
         self.refresh_cli_status()
         self._active_stage = None
-        self._set_task_status("supervisor", "done")
-        self._set_review_states("done")
+        self._set_task_status("codex", "done")
         self._set_task_status("renderer", "waiting")
-        self._set_task_status("repair", "idle")
-        self._add_history_line("Validation: passed")
+        self._add_history_line("Validation: passed" if build_ok else "Validation: build warning")
 
         editor = self._main_window.components["editor"]
         editor.set_text(generated + "\n")
         editor.reset_modified()
-        self._finish_activity("Codex ready", "script inserted into editor")
-        self._finish_history_entry("Ready", "script inserted into editor")
+        ready_detail = "script inserted into editor"
+        if not build_ok:
+            ready_detail = "script inserted into editor; render may fail"
+        self._finish_activity("Codex ready", ready_detail)
+        self._finish_history_entry("Ready", ready_detail)
         self.prompt.clear()
         if self.mode_combo.currentData() == "new":
             self.mode_combo.setCurrentIndex(max(self.mode_combo.findData("refine"), 0))
