@@ -204,6 +204,37 @@ def test_handle_traceback_shows_render_specific_failure():
     assert "fillet" in text.lower() or "chamfer" in text.lower()
 
 
+def test_auto_repair_escalates_render_failure(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    main = DummyMain()
+    panel = StartPanel(main)
+    panel._codex_path = "codex"
+    panel._codex_login_ok = True
+    panel._auto_repair_budget = 1
+    calls = []
+
+    monkeypatch.setattr(
+        "cq_editor.widgets.start_panel.QTimer.singleShot",
+        lambda _ms, fn: fn(),
+    )
+    monkeypatch.setattr(
+        panel,
+        "generate_with_codex",
+        lambda *args, **kwargs: calls.append(kwargs),
+    )
+
+    assert panel._begin_auto_repair("RuntimeError: render failed") is True
+    assert panel._auto_repair_budget == 0
+    assert calls == [
+        {
+            "auto_prompt": "Repair the current CadQuery script with the smallest viable change. Fix this render error: RuntimeError: render failed",
+            "auto_mode": "repair",
+            "auto_effort": "xhigh",
+            "skip_confirm": True,
+        }
+    ]
+
+
 def test_context_summary_detects_project_agents(panel):
     summary = panel._context_summary()
 

@@ -91,6 +91,9 @@ class StartPanel(QWidget, ComponentMixin):
         self._last_traceback_text = ""
         self._last_prompt_text = ""
         self._codex_abort_reason = None
+        self._auto_repair_budget = 0
+        self._auto_repair_pending = False
+        self._auto_repair_detail = ""
         self._pipeline_queue = []
         self._active_stage = None
         self._pipeline_script = ""
@@ -357,6 +360,8 @@ class StartPanel(QWidget, ComponentMixin):
             ("Stop", "停止"),
             ("Codex stopped", "Codex 已停止"),
             ("Codex timed out", "Codex 已逾時"),
+            ("Auto repairing", "自動修復中"),
+            ("Queued auto repair", "已排入自動修復"),
             ("No active stage", "目前沒有執行中的階段"),
             ("CLI: thread started", "CLI: 執行緒已建立"),
             ("CLI: turn started", "CLI: 回合已開始"),
@@ -535,6 +540,45 @@ class StartPanel(QWidget, ComponentMixin):
         self._text_state["failure_label"] = text
         self.failure_label.setText(self._translate_text(text))
         self.failure_label.show()
+
+    def _begin_auto_repair(self, detail):
+
+        if (
+            self._auto_repair_budget <= 0
+            or self._auto_repair_pending
+            or self._codex_process is not None
+            or not self._codex_path
+            or not self._codex_login_ok
+        ):
+            return False
+
+        self._auto_repair_budget -= 1
+        self._auto_repair_pending = True
+        self._auto_repair_detail = detail
+        self._append_latest_history_line("Auto repair: escalating render failure to xhigh repair")
+        self._set_text("status_label", self.status_label, "Status: Queued auto repair")
+        self._set_text("detail_label", self.detail_label, f"Stage: {detail}")
+        QTimer.singleShot(0, self._run_auto_repair)
+        return True
+
+    def _run_auto_repair(self):
+
+        if not self._auto_repair_pending:
+            return
+
+        detail = self._auto_repair_detail
+        self._auto_repair_pending = False
+        self._auto_repair_detail = ""
+        prompt_text = (
+            "Repair the current CadQuery script with the smallest viable change. "
+            f"Fix this render error: {detail}"
+        )
+        self.generate_with_codex(
+            auto_prompt=prompt_text,
+            auto_mode="repair",
+            auto_effort="xhigh",
+            skip_confirm=True,
+        )
 
     def _record_cli_event(self, summary):
 
@@ -1424,6 +1468,9 @@ class StartPanel(QWidget, ComponentMixin):
                 f"viewer {state.get('viewer_apply_time_s', 0.0):.4f}s"
             )
             self._set_task_status("renderer", "done")
+            self._auto_repair_budget = 0
+            self._auto_repair_pending = False
+            self._auto_repair_detail = ""
             self._finish_activity(f"Done ({mode})", detail)
             self._set_text(
                 "elapsed_label",
@@ -1442,6 +1489,8 @@ class StartPanel(QWidget, ComponentMixin):
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self._status_timer.stop()
+            if self._begin_auto_repair(detail):
+                self._append_latest_history_line("Auto repair started")
 
         QApplication.processEvents()
 
@@ -1463,6 +1512,8 @@ class StartPanel(QWidget, ComponentMixin):
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
         self._status_timer.stop()
+        if self._begin_auto_repair(self._last_traceback_text):
+            self._append_latest_history_line("Auto repair started")
         QApplication.processEvents()
 
     def _read_codex_stdout(self):
@@ -1530,19 +1581,29 @@ class StartPanel(QWidget, ComponentMixin):
 
         return "Codex generation failed. Run `codex login` and try again."
 
-    def generate_with_codex(self):
+    def generate_with_codex(
+        self, auto_prompt=None, auto_mode=None, auto_effort=None, skip_confirm=False
+    ):
 
         if not self._codex_path:
             warning("Codex CLI not found. Install it first.")
             return
 
-        if not self.prompt.toPlainText().strip():
+        prompt_text = (auto_prompt or self.prompt.toPlainText()).strip()
+        if not prompt_text:
             warning("Enter a CadQuery prompt first.")
             return
 
         editor = self._main_window.components["editor"]
-        if not editor.confirm_discard():
+        if not skip_confirm and not editor.confirm_discard():
             return
+
+        if auto_mode:
+            self.mode_combo.setCurrentIndex(max(self.mode_combo.findData(auto_mode), 0))
+        if auto_effort:
+            self.planner_effort.setCurrentText(auto_effort)
+        if auto_prompt is not None:
+            self.prompt.setPlainText(prompt_text)
 
         self._pipeline_queue = self._build_stage_plan()
         self._pipeline_script = ""
@@ -1551,13 +1612,14 @@ class StartPanel(QWidget, ComponentMixin):
             "cached_input_tokens": 0,
             "output_tokens": 0,
         }
-        self._last_prompt_text = self.prompt.toPlainText().strip()
+        self._last_prompt_text = prompt_text
         self._start_history_entry()
         self._add_history_line(f"Context: {self._context_summary()}")
         self._set_section_visible("workflow", True)
         self._set_task_status("codex", "running")
         self._set_task_status("renderer", "waiting")
         self._set_generating(True)
+        self._auto_repair_pending = False
         self._set_text("cli_label", self.cli_label, "Codex CLI: generating...")
         self._set_usage_summary(input_tokens=0, cached_tokens=0, output_tokens=0)
         info("Codex generation started")
@@ -1652,6 +1714,9 @@ class StartPanel(QWidget, ComponentMixin):
         self._set_task_status("codex", "done")
         self._set_task_status("renderer", "waiting")
         self._add_history_line("Validation: passed" if build_ok else "Validation: build warning")
+        self._auto_repair_budget = 0 if self.mode_combo.currentData() == "repair" else 1
+        self._auto_repair_pending = False
+        self._auto_repair_detail = ""
 
         editor = self._main_window.components["editor"]
         editor.set_text(generated + "\n")
