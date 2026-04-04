@@ -893,6 +893,7 @@ class StartPanel(QWidget, ComponentMixin):
             "Return only raw Python code with no markdown fences or explanation.",
             "Use import cadquery as cq.",
             "Assign the final shape to result and call show_object(result).",
+            'For simple primitives, prefer direct Workplane primitives such as cq.Workplane("XY").circle(r), sphere(r), box(x, y, z), or cylinder(h, r).',
             "Prefer native CadQuery operations where applicable: extrude, revolve, loft, sweep, union, cut, hole, fillet, chamfer, mirrorX, mirrorY, rarray, parray.",
             "Avoid manually recreating repeated or symmetric geometry when a native mirror or pattern tool fits.",
             "At least 70% of repeated, symmetric, or patterned geometry must rely on native CadQuery feature operations instead of one-by-one placement.",

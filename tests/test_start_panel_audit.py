@@ -309,5 +309,6 @@ def test_build_stage_prompt_uses_single_cli_prompt(panel):
     prompt = panel._build_stage_prompt(stage, "")
 
     assert "Write one CadQuery Python script for CQ-editor." in prompt
+    assert 'cq.Workplane("XY").circle(r)' in prompt
     assert "reasoning effort high" in prompt
     assert "User request: Draw a gear." in prompt
