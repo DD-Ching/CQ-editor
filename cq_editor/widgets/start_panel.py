@@ -304,6 +304,7 @@ class StartPanel(QWidget, ComponentMixin):
             ("Status:", "狀態:"),
             ("Stage:", "階段:"),
             ("Problem:", "問題:"),
+            ("Hint:", "提示:"),
             ("Next:", "下一步:"),
             ("CLI tail:", "CLI 尾端:"),
             ("Context:", "上下文:"),
@@ -512,6 +513,29 @@ class StartPanel(QWidget, ComponentMixin):
         self.failure_label.setText(self._translate_text(text))
         self.failure_label.show()
 
+    def _render_failure_hint(self, detail):
+
+        lowered = detail.lower()
+        if "chfi3d_builder" in lowered or "only 2 faces" in lowered:
+            return "Fillet or chamfer is too aggressive, or the selected edges do not support that operation. Try a smaller radius or a narrower edge selection."
+        if "bopalgo" in lowered or "boolean" in lowered:
+            return "A boolean union or cut likely failed. Check whether the solids overlap cleanly before combining them."
+        if "cannot find a solid" in lowered:
+            return "A workplane chain lost its solid. Check the feature sequence before calling cut, union, intersect, or hole."
+        return "Use Repair mode and ask Codex to fix the current render error with the smallest viable change."
+
+    def _show_render_failure(self, detail):
+
+        lines = [
+            f"Problem: {detail}",
+            "Stage: CQ render",
+            f"Hint: {self._render_failure_hint(detail)}",
+        ]
+        text = "\n".join(lines)
+        self._text_state["failure_label"] = text
+        self.failure_label.setText(self._translate_text(text))
+        self.failure_label.show()
+
     def _record_cli_event(self, summary):
 
         if not summary:
@@ -644,6 +668,19 @@ class StartPanel(QWidget, ComponentMixin):
             return
 
         self._active_history_item.addChild(QTreeWidgetItem([self._history_text(text)]))
+
+    def _append_latest_history_line(self, text, expand=True):
+
+        if self._active_history_item is not None:
+            self._add_history_line(text)
+            return
+        if self.history_tree.topLevelItemCount() == 0:
+            return
+
+        item = self.history_tree.topLevelItem(0)
+        item.addChild(QTreeWidgetItem([self._history_text(text)]))
+        if expand:
+            item.setExpanded(True)
 
     def _compact_script_context(self, script):
 
@@ -1395,10 +1432,13 @@ class StartPanel(QWidget, ComponentMixin):
             )
         elif event == "error":
             self._set_section_visible("workflow", True)
+            self._set_section_visible("history", True)
             self._set_task_status("renderer", "error")
-            self._show_failure(state.get("message", "unknown error"))
+            detail = state.get("message", "unknown error")
+            self._show_render_failure(detail)
+            self._append_latest_history_line(f"Render failed: {detail}")
             self._set_text("status_label", self.status_label, f"Status: {mode} failed")
-            self._set_text("detail_label", self.detail_label, f"Stage: {state.get('message', 'unknown error')}")
+            self._set_text("detail_label", self.detail_label, f"Stage: {detail}")
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self._status_timer.stop()
@@ -1414,8 +1454,10 @@ class StartPanel(QWidget, ComponentMixin):
         exc_type, exc, _tb = exc_info
         self._last_traceback_text = f"{exc_type.__name__}: {exc}"
         self._set_section_visible("workflow", True)
+        self._set_section_visible("history", True)
         self._set_task_status("renderer", "error")
-        self._show_failure(self._last_traceback_text)
+        self._show_render_failure(self._last_traceback_text)
+        self._append_latest_history_line(f"Render failed: {self._last_traceback_text}")
         self._set_text("status_label", self.status_label, "Status: Render failed")
         self._set_text("detail_label", self.detail_label, f"Stage: {exc_type.__name__}: {exc}")
         self.progress.setRange(0, 1)

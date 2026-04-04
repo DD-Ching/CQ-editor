@@ -1,7 +1,7 @@
 import pytest
 from types import SimpleNamespace
 
-from PyQt5.QtWidgets import QApplication, QMainWindow
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTreeWidgetItem
 
 from cq_editor.widgets.start_panel import StartPanel
 
@@ -184,6 +184,24 @@ def test_handle_codex_event_updates_detail_and_history():
     assert panel._codex_event_summaries[-1] == "CLI: turn started"
     assert "turn started" in panel.detail_label.text()
     assert panel._active_history_item.childCount() >= 3
+
+
+def test_handle_traceback_shows_render_specific_failure():
+    app = QApplication.instance() or QApplication([])
+    main = DummyMain()
+    panel = StartPanel(main)
+    panel._codex_event_summaries = ["CLI: stage completed"]
+    panel._codex_stderr = ["ERROR: transport closed\n"]
+    panel.history_tree.insertTopLevelItem(0, QTreeWidgetItem(["Round 1 · Ready"]))
+
+    exc_info = (RuntimeError, RuntimeError("Standard_Failure: ChFi3d_Builder:only 2 faces"), None)
+    panel.handle_traceback(exc_info, "")
+
+    text = panel.failure_label.text()
+    assert "Stage: CQ render" in text
+    assert "Hint:" in text
+    assert "CLI tail:" not in text
+    assert "fillet" in text.lower() or "chamfer" in text.lower()
 
 
 def test_context_summary_detects_project_agents(panel):
