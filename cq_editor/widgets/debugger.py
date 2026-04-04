@@ -1,12 +1,14 @@
 import sys
 from contextlib import ExitStack, contextmanager
 from enum import Enum, auto
+from time import perf_counter
 from types import SimpleNamespace, FrameType, ModuleType
 from typing import List
 from bdb import BdbQuit
 from inspect import currentframe
 
 import cadquery as cq
+from cadquery.graph_exec import IncrementalExecutionSession, UnsupportedScriptError
 from PyQt5 import QtCore
 from PyQt5.QtCore import (
     Qt,
@@ -15,7 +17,7 @@ from PyQt5.QtCore import (
     pyqtSignal,
     QEventLoop,
     QAbstractTableModel,
-)
+    )
 from PyQt5.QtWidgets import QAction, QTableView
 
 from logbook import info
@@ -122,12 +124,14 @@ class Debugger(QObject, ComponentMixin):
             {"name": "Add script dir to path", "type": "bool", "value": True},
             {"name": "Change working dir to script dir", "type": "bool", "value": True},
             {"name": "Reload imported modules", "type": "bool", "value": True},
+            {"name": "Incremental execution (MVP)", "type": "bool", "value": True},
         ],
     )
 
     sigRendered = pyqtSignal(dict)
     sigLocals = pyqtSignal(dict)
     sigTraceback = pyqtSignal(object, str)
+    sigRenderState = pyqtSignal(dict)
 
     sigFrameChanged = pyqtSignal(object)
     sigLineChanged = pyqtSignal(int)
@@ -184,6 +188,8 @@ class Debugger(QObject, ComponentMixin):
 
         self._frames = []
         self._stop_debugging = False
+        self._incremental_session = IncrementalExecutionSession()
+        self._incremental_filename = None
 
     def get_current_script(self):
 
@@ -216,6 +222,12 @@ class Debugger(QObject, ComponentMixin):
 
     def _exec(self, code, locals_dict, globals_dict):
 
+        with self._execution_context():
+            exec(code, locals_dict, globals_dict)
+
+    @contextmanager
+    def _execution_context(self):
+
         with ExitStack() as stack:
             p = (self.get_current_script_path() or Path("")).absolute().dirname()
 
@@ -227,7 +239,7 @@ class Debugger(QObject, ComponentMixin):
             if self.preferences["Reload imported modules"]:
                 stack.enter_context(module_manager())
 
-            exec(code, locals_dict, globals_dict)
+            yield
 
     @staticmethod
     def _rand_color(alpha=0.0, cfloat=False):
@@ -255,22 +267,34 @@ class Debugger(QObject, ComponentMixin):
 
         cq_objects = {}
 
-        def _show_object(obj, name=None, options={}):
+        def _show_object(obj, name=None, options=None, **kwargs):
 
-            if name:
-                cq_objects.update({name: SimpleNamespace(shape=obj, options=options)})
+            if options is None:
+                options = {}
             else:
-                # get locals of the enclosing scope
-                d = currentframe().f_back.f_locals
+                options = dict(options)
+            options.update(kwargs)
 
-                # try to find the name
-                try:
-                    name = list(d.keys())[list(d.values()).index(obj)]
-                except ValueError:
-                    # use id if not found
-                    name = str(id(obj))
+            if name is None:
+                name = self._resolve_object_name(module, obj)
 
-                cq_objects.update({name: SimpleNamespace(shape=obj, options=options)})
+            node_id = module.__dict__.get("__cq_node_id__")
+            cache_status = module.__dict__.get("__cq_cache_status__", "miss")
+            output_index = max(int(module.__dict__.get("__cq_output_index__", 1)) - 1, 0)
+            viewer_key = self._viewer_key(node_id, name, output_index)
+
+            cq_objects.update(
+                {
+                    name: SimpleNamespace(
+                        shape=obj,
+                        options=options,
+                        node_id=node_id,
+                        cache_status=cache_status,
+                        viewer_key=viewer_key,
+                        display_name=name,
+                    )
+                }
+            )
 
         def _debug(obj, name=None):
 
@@ -284,10 +308,78 @@ class Debugger(QObject, ComponentMixin):
 
         return cq_objects, set(module.__dict__) - {"cq"}
 
+    def _resolve_object_name(self, module, obj):
+
+        frame = currentframe()
+        caller = frame.f_back.f_back if frame and frame.f_back and frame.f_back.f_back else None
+        d = caller.f_locals if caller else {}
+
+        try:
+            return list(d.keys())[list(d.values()).index(obj)]
+        except ValueError:
+            for key, value in module.__dict__.items():
+                if key.startswith("_"):
+                    continue
+                if value is obj:
+                    return key
+
+        return str(id(obj))
+
+    def _viewer_key(self, node_id, name, output_index):
+
+        if node_id:
+            return f"{node_id}:{name}:{output_index}"
+
+        return f"{name}:{output_index}"
+
     def _cleanup_locals(self, module, injected_names):
 
         for name in injected_names:
-            module.__dict__.pop(name)
+            module.__dict__.pop(name, None)
+
+    def _format_render_names(self, names, limit=6):
+
+        if not names:
+            return "-"
+        if len(names) <= limit:
+            return ", ".join(names)
+        return f"{', '.join(names[:limit])}, +{len(names) - limit} more"
+
+    def _log_render_status(self, incremental, exec_time_s):
+
+        viewer_stats = self.parent().components["object_tree"].last_viewer_update_stats
+        info(
+            "\n".join(
+                (
+                    f"Incremental render: {'yes' if incremental else 'no'}",
+                    f"Updated: {self._format_render_names(viewer_stats.get('updated_names', []))}",
+                    f"Reused: {self._format_render_names(viewer_stats.get('reused_names', []))}",
+                    f"Exec: {exec_time_s:.3f}s",
+                    f"Viewer: {viewer_stats.get('apply_time_s', 0.0):.4f}s",
+                )
+            )
+        )
+
+    def _emit_render_state(self, payload):
+
+        self.sigRenderState.emit(payload)
+
+    def _render_finish_state(self, incremental, exec_time_s):
+
+        viewer_stats = self.parent().components["object_tree"].last_viewer_update_stats
+        return {
+            "event": "finish",
+            "mode": "incremental" if incremental else "full",
+            "incremental": incremental,
+            "exec_time_s": exec_time_s,
+            "viewer_apply_time_s": viewer_stats.get("apply_time_s", 0.0),
+            "updated_names": viewer_stats.get("updated_names", []),
+            "reused_names": viewer_stats.get("reused_names", []),
+            "updated_count": viewer_stats.get("updated", 0),
+            "reused_count": viewer_stats.get("reused", 0),
+            "added_count": viewer_stats.get("added", 0),
+            "removed_count": viewer_stats.get("removed", 0),
+        }
 
     @pyqtSlot(bool)
     def render(self):
@@ -295,15 +387,70 @@ class Debugger(QObject, ComponentMixin):
         seed(59798267586177)
         if self.preferences["Reload CQ"]:
             reload_cq()
+            self._incremental_session.reset()
 
         cq_script = self.get_current_script()
         cq_script_path = self.get_current_script_path()
+        current_filename = str(cq_script_path or DUMMY_FILE)
+        if current_filename != self._incremental_filename:
+            self._incremental_session.reset()
+            self._incremental_filename = current_filename
+
+        if self.preferences["Incremental execution (MVP)"]:
+            try:
+                cq_objects, module_dict, metrics = self._render_incremental(
+                    cq_script, cq_script_path
+                )
+                self.sigRendered.emit(cq_objects)
+                self.sigTraceback.emit(None, cq_script)
+                self.sigLocals.emit(module_dict)
+                self._log_render_status(True, metrics.total_runtime_s)
+                self._emit_render_state(
+                    self._render_finish_state(True, metrics.total_runtime_s)
+                )
+                return
+            except UnsupportedScriptError:
+                self._incremental_session.reset()
+                self._emit_render_state(
+                    {
+                        "event": "fallback",
+                        "mode": "incremental",
+                        "message": "Unsupported script shape. Falling back to full render.",
+                    }
+                )
+            except Exception:
+                exc_info = sys.exc_info()
+                sys.last_traceback = exc_info[-1]
+                self._emit_render_state(
+                    {
+                        "event": "error",
+                        "mode": "incremental",
+                        "message": str(exc_info[1]),
+                    }
+                )
+                self.sigTraceback.emit(exc_info, cq_script)
+                return
+
         cq_code, module = self.compile_code(cq_script, cq_script_path)
 
         if cq_code is None:
+            self._emit_render_state(
+                {
+                    "event": "error",
+                    "mode": "full",
+                    "message": "Compile failed",
+                }
+            )
             return
 
         cq_objects, injected_names = self._inject_locals(module)
+        render_start = perf_counter()
+        self._emit_render_state(
+            {
+                "event": "start",
+                "mode": "full",
+            }
+        )
 
         try:
             self._exec(cq_code, module.__dict__, module.__dict__)
@@ -317,10 +464,57 @@ class Debugger(QObject, ComponentMixin):
             self.sigRendered.emit(cq_objects)
             self.sigTraceback.emit(None, cq_script)
             self.sigLocals.emit(module.__dict__)
+            exec_time_s = perf_counter() - render_start
+            self._log_render_status(False, exec_time_s)
+            self._emit_render_state(self._render_finish_state(False, exec_time_s))
         except Exception:
             exc_info = sys.exc_info()
             sys.last_traceback = exc_info[-1]
+            self._emit_render_state(
+                {
+                    "event": "error",
+                    "mode": "full",
+                    "message": str(exc_info[1]),
+                }
+            )
             self.sigTraceback.emit(exc_info, cq_script)
+
+    def _render_incremental(self, cq_script, cq_script_path):
+
+        module = ModuleType("__cq_main__")
+        if cq_script_path:
+            module.__dict__["__file__"] = cq_script_path
+
+        cq_objects, injected_names = self._inject_locals(module)
+
+        try:
+            hooks = {
+                name: module.__dict__[name]
+                for name in ("show_object", "debug")
+                if name in module.__dict__
+            }
+
+            with self._execution_context():
+                result = self._incremental_session.execute(
+                    cq_script,
+                    env=module.__dict__,
+                    filename=str(cq_script_path or DUMMY_FILE),
+                    hooks=hooks,
+                    progress_callback=self._emit_render_state,
+                )
+
+            if not result.success:
+                raise result.exception
+
+            self._cleanup_locals(module, injected_names)
+
+            if len(cq_objects) == 0:
+                cq_objects = find_cq_objects(module.__dict__)
+
+            return cq_objects, module.__dict__, result.instrumentation
+        finally:
+            if injected_names:
+                self._cleanup_locals(module, injected_names)
 
     @property
     def breakpoints(self):

@@ -38,6 +38,9 @@ class TracebackPane(QWidget, ComponentMixin):
         self.tree = TracebackTree(self)
         self.current_exception = QLabel(self)
         self.current_exception.setStyleSheet("QLabel {color : red; }")
+        self.current_exception.setWordWrap(True)
+        self.current_exception.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.tree.setMinimumHeight(180)
 
         layout(self, (self.current_exception, self.tree), self)
 
@@ -80,10 +83,7 @@ class TracebackPane(QWidget, ComponentMixin):
             exc_msg = str(exc)
             exc_msg = exc_msg.replace("<", "&lt;").replace(">", "&gt;")  # replace <>
 
-            truncated_msg = self.truncate_text(exc_msg)
-            self.current_exception.setText(
-                "<b>{}</b>: {}".format(exc_name, truncated_msg)
-            )
+            self.current_exception.setText("<b>{}</b>: {}".format(exc_name, exc_msg))
             self.current_exception.setToolTip(exc_msg)
 
             # handle the special case of a SyntaxError

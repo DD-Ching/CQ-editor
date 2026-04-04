@@ -1,3 +1,5 @@
+from time import perf_counter
+
 from PyQt5.QtWidgets import (
     QTreeWidget,
     QTreeWidgetItem,
@@ -13,6 +15,8 @@ from pyqtgraph.parametertree import Parameter, ParameterTree
 from OCP.AIS import AIS_Line
 from OCP.Geom import Geom_Line
 from OCP.gp import gp_Dir, gp_Pnt, gp_Ax1
+
+from cadquery.viewer_diff import ViewerShapeRecord, apply_diff_to_viewer, compute_diff
 
 from ..mixins import ComponentMixin
 from ..icons import icon
@@ -51,6 +55,9 @@ class ObjectTreeItem(QTreeWidgetItem):
         shape=None,
         shape_display=None,
         sig=None,
+        viewer_key=None,
+        node_id=None,
+        cache_status="miss",
         alpha=0.0,
         color="#f4a824",
         **kwargs,
@@ -64,6 +71,9 @@ class ObjectTreeItem(QTreeWidgetItem):
         self.shape = shape
         self.shape_display = shape_display
         self.sig = sig
+        self.viewer_key = viewer_key or name
+        self.node_id = node_id
+        self.cache_status = cache_status
 
         self.properties = Parameter.create(name="Properties", children=self.props)
 
@@ -123,6 +133,7 @@ class ObjectTree(QWidget, ComponentMixin):
     preferences = Parameter.create(
         name="Preferences",
         children=[
+            {"name": "Viewer diff (MVP)", "type": "bool", "value": True},
             {"name": "Preserve properties on reload", "type": "bool", "value": False},
             {"name": "Clear all before each run", "type": "bool", "value": True},
             {"name": "STL precision", "type": "float", "value": 0.1},
@@ -195,6 +206,26 @@ class ObjectTree(QWidget, ComponentMixin):
         tree.itemSelectionChanged.connect(self.handleSelection)
         tree.customContextMenuRequested.connect(self.showMenu)
 
+        self.previous_shapes = {}
+        self.current_shapes = {}
+        self._cq_items_by_key = {}
+        self._pending_removed_ais = []
+        self._pending_added_ais = []
+        self._pending_request_fit = False
+        self._pending_props_by_key = {}
+        self.last_viewer_update_stats = {
+            "mode": "full",
+            "removed": 0,
+            "added": 0,
+            "updated": 0,
+            "reused": 0,
+            "updated_names": [],
+            "reused_names": [],
+            "compute_time_s": 0.0,
+            "apply_time_s": 0.0,
+            "total_time_s": 0.0,
+        }
+
         self.prepareLayout()
 
     def prepareMenu(self):
@@ -259,14 +290,34 @@ class ObjectTree(QWidget, ComponentMixin):
 
         return current_params
 
+    def _current_properties_by_key(self):
+
+        current_params = {}
+        for i in range(self.CQ.childCount()):
+            child = self.CQ.child(i)
+            current_params[getattr(child, "viewer_key", child.properties["Name"])] = (
+                child.properties
+            )
+
+        return current_params
+
     def _restore_properties(self, obj, properties):
 
         for p in properties[obj.properties["Name"]]:
             obj.properties[p.name()] = p.value()
 
+    def _restore_properties_by_key(self, obj, properties_by_key, key):
+
+        if key not in properties_by_key:
+            return
+
+        for p in properties_by_key[key]:
+            obj.properties[p.name()] = p.value()
+
     @pyqtSlot(dict, bool)
     @pyqtSlot(dict)
     def addObjects(self, objects, clean=False, root=None):
+        add_start = perf_counter()
 
         if root is None:
             root = self.CQ
@@ -276,14 +327,48 @@ class ObjectTree(QWidget, ComponentMixin):
 
         if preserve_props:
             current_props = self._current_properties()
+            current_props_by_key = self._current_properties_by_key()
+        else:
+            current_props = {}
+            current_props_by_key = {}
+
+        # remove empty objects
+        objects_f = {k: v for k, v in objects.items() if not is_obj_empty(v.shape)}
+
+        use_viewer_diff = (
+            root is self.CQ
+            and self.preferences["Viewer diff (MVP)"]
+            and not clean
+        )
+
+        if use_viewer_diff:
+            try:
+                current_shapes = self._shape_records(objects_f)
+                self._pending_removed_ais = []
+                self._pending_added_ais = []
+                self._pending_request_fit = request_fit_view
+                self._pending_props_by_key = current_props_by_key
+                diff = compute_diff(self.previous_shapes, current_shapes)
+                apply_diff_to_viewer(self, diff)
+                self.previous_shapes = current_shapes
+                self.current_shapes = current_shapes
+                self.last_viewer_update_stats = {
+                    "mode": "diff",
+                    **diff.stats(),
+                    "updated_names": self._shape_names(current_shapes, diff.updated_keys),
+                    "reused_names": self._shape_names(current_shapes, diff.reused_keys),
+                    "total_time_s": perf_counter() - add_start,
+                }
+                return
+            except Exception:
+                self.previous_shapes = {}
+                self.current_shapes = {}
+                self._cq_items_by_key = {}
 
         if clean or self.preferences["Clear all before each run"]:
             self.removeObjects()
 
         ais_list = []
-
-        # remove empty objects
-        objects_f = {k: v for k, v in objects.items() if not is_obj_empty(v.shape)}
 
         for name, obj in objects_f.items():
             ais, shape_display = make_AIS(obj.shape, obj.options)
@@ -294,6 +379,9 @@ class ObjectTree(QWidget, ComponentMixin):
                 shape_display=shape_display,
                 ais=ais,
                 sig=self.sigObjectPropertiesChanged,
+                viewer_key=getattr(obj, "viewer_key", name),
+                node_id=getattr(obj, "node_id", None),
+                cache_status=getattr(obj, "cache_status", "miss"),
             )
 
             if preserve_props and name in current_props:
@@ -303,6 +391,25 @@ class ObjectTree(QWidget, ComponentMixin):
                 ais_list.append(ais)
 
             root.addChild(child)
+            if root is self.CQ:
+                self._cq_items_by_key[child.viewer_key] = child
+
+        if root is self.CQ:
+            full_apply_time = perf_counter() - add_start
+            self.previous_shapes = self._shape_records(objects_f)
+            self.current_shapes = dict(self.previous_shapes)
+            self.last_viewer_update_stats = {
+                "mode": "full",
+                "removed": 0,
+                "added": len(ais_list),
+                "updated": len(ais_list),
+                "reused": 0,
+                "updated_names": list(objects_f.keys()),
+                "reused_names": [],
+                "compute_time_s": 0.0,
+                "apply_time_s": full_apply_time,
+                "total_time_s": full_apply_time,
+            }
 
         if request_fit_view:
             self.sigObjectsAdded[list, bool].emit(ais_list, True)
@@ -326,6 +433,7 @@ class ObjectTree(QWidget, ComponentMixin):
                 shape_display=shape_display,
                 ais=ais,
                 sig=self.sigObjectPropertiesChanged,
+                viewer_key=name,
             )
         )
 
@@ -336,9 +444,17 @@ class ObjectTree(QWidget, ComponentMixin):
     def removeObjects(self, objects=None):
 
         if objects:
-            removed_items_ais = [self.CQ.takeChild(i).ais for i in objects]
+            removed_items = [self.CQ.takeChild(i) for i in objects]
+            removed_items_ais = [item.ais for item in removed_items if item is not None]
+            for item in removed_items:
+                if item is not None:
+                    self._cq_items_by_key.pop(getattr(item, "viewer_key", ""), None)
         else:
-            removed_items_ais = [ch.ais for ch in self.CQ.takeChildren()]
+            removed_children = self.CQ.takeChildren()
+            removed_items_ais = [ch.ais for ch in removed_children]
+            self._cq_items_by_key = {}
+            self.previous_shapes = {}
+            self.current_shapes = {}
 
         self.sigObjectsRemoved.emit(removed_items_ais)
 
@@ -348,12 +464,106 @@ class ObjectTree(QWidget, ComponentMixin):
         if action:
             self._stash = self.CQ.takeChildren()
             removed_items_ais = [ch.ais for ch in self._stash]
+            self._cq_items_by_key = {}
             self.sigObjectsRemoved.emit(removed_items_ais)
         else:
             self.removeObjects()
             self.CQ.addChildren(self._stash)
             ais_list = [el.ais for el in self._stash]
+            self._cq_items_by_key = {
+                getattr(el, "viewer_key", el.properties["Name"]): el for el in self._stash
+            }
             self.sigObjectsAdded.emit(ais_list)
+
+    def _shape_records(self, objects):
+
+        records = {}
+        for name, obj in objects.items():
+            key = getattr(obj, "viewer_key", name)
+            if key in records:
+                raise ValueError(f"Duplicate viewer key detected: {key}")
+            records[key] = ViewerShapeRecord(
+                key=key,
+                name=getattr(obj, "display_name", name),
+                shape=obj.shape,
+                options=dict(obj.options),
+                node_id=getattr(obj, "node_id", None),
+                cache_status=getattr(obj, "cache_status", "miss"),
+            )
+
+        return records
+
+    def _shape_names(self, records, keys):
+
+        return [records[key].name for key in keys if key in records]
+
+    def remove_diff_items(self, keys):
+
+        for key in keys:
+            item = self._cq_items_by_key.pop(key, None)
+            if item is None:
+                continue
+
+            index = self.CQ.indexOfChild(item)
+            if index != -1:
+                removed = self.CQ.takeChild(index)
+                self._pending_removed_ais.append(removed.ais)
+
+    def move_diff_item(self, key, index):
+
+        item = self._cq_items_by_key.get(key)
+        if item is None:
+            return
+
+        current_index = self.CQ.indexOfChild(item)
+        if current_index == -1 or current_index == index:
+            return
+
+        moved = self.CQ.takeChild(current_index)
+        self.CQ.insertChild(index, moved)
+
+    def upsert_diff_item(self, key, record, index):
+
+        ais, shape_display = make_AIS(record.shape, record.options)
+        child = ObjectTreeItem(
+            record.name,
+            shape=record.shape,
+            shape_display=shape_display,
+            ais=ais,
+            sig=self.sigObjectPropertiesChanged,
+            viewer_key=key,
+            node_id=record.node_id,
+            cache_status=record.cache_status,
+        )
+
+        self._restore_properties_by_key(child, self._pending_props_by_key, key)
+
+        self.CQ.insertChild(index, child)
+        self._cq_items_by_key[key] = child
+        if child.properties["Visible"]:
+            self._pending_added_ais.append(ais)
+
+    def record_viewer_diff(self, diff):
+
+        if self._pending_removed_ais:
+            self.sigObjectsRemoved.emit(self._pending_removed_ais)
+
+        if self._pending_added_ais:
+            if self._pending_request_fit:
+                self.sigObjectsAdded[list, bool].emit(self._pending_added_ais, True)
+            else:
+                self.sigObjectsAdded[list].emit(self._pending_added_ais)
+
+        self.last_viewer_update_stats = {
+            "mode": "diff",
+            **diff.stats(),
+            "updated_names": self._shape_names(diff.current_shapes, diff.updated_keys),
+            "reused_names": self._shape_names(diff.current_shapes, diff.reused_keys),
+        }
+        self._pending_removed_ais = []
+        self._pending_added_ais = []
+        self._pending_request_fit = False
+        self._pending_props_by_key = {}
 
     @pyqtSlot()
     def removeSelected(self):

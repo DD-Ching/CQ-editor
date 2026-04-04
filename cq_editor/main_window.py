@@ -1,6 +1,6 @@
 import sys
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtGui import QPalette, QColor
 from PyQt5.QtWidgets import (
     QLabel,
@@ -15,6 +15,7 @@ from logbook import Logger
 import cadquery as cq
 
 from .widgets.editor import Editor
+from .widgets.start_panel import StartPanel
 from .widgets.viewer import OCCViewer
 from .widgets.console import ConsoleWidget
 from .widgets.object_tree import ObjectTree
@@ -133,6 +134,7 @@ class MainWindow(QMainWindow, MainMixin):
             self.components["editor"].load_from_file(filename)
 
         self.restoreComponentState()
+        self.configure_workspace()
 
     def handleEditorVisiblityChange(self, visible):
         """
@@ -240,6 +242,12 @@ class MainWindow(QMainWindow, MainMixin):
         )
 
         self.registerComponent("debugger", Debugger(self))
+
+        self.registerComponent(
+            "start",
+            StartPanel(self),
+            lambda c: dock(c, "Start", self, defaultArea="left"),
+        )
 
         self.registerComponent(
             "console",
@@ -383,7 +391,7 @@ class MainWindow(QMainWindow, MainMixin):
             self.components["object_tree"].addObjects
         )
         self.components["debugger"].sigTraceback.connect(
-            self.components["traceback_viewer"].addTraceback
+            self.handle_traceback
         )
         self.components["debugger"].sigLocals.connect(
             self.components["variables_viewer"].update_frame
@@ -455,9 +463,7 @@ class MainWindow(QMainWindow, MainMixin):
         self.components["debugger"].sigCQChanged.connect(
             self.components["object_tree"].addObjects
         )
-        self.components["debugger"].sigTraceback.connect(
-            self.components["traceback_viewer"].addTraceback
-        )
+        self.components["debugger"].sigRenderState.connect(self.handle_render_state)
 
         # trigger re-render when file is modified externally or saved
         self.components["editor"].triggerRerender.connect(
@@ -493,6 +499,7 @@ class MainWindow(QMainWindow, MainMixin):
         self.components["editor"].set_text(
             'import cadquery as cq\nresult = cq.Workplane("XY" ).box(3, 3, 0.5).edges("|Z").fillet(0.125)\nshow_object(result)'
         )
+        self.components["editor"].reset_modified()
 
     def setup_logging(self):
 
@@ -547,6 +554,89 @@ class MainWindow(QMainWindow, MainMixin):
 
         new_title = fname if fname else "*"
         self.setWindowTitle(f"{self.name}: {new_title}")
+
+    def configure_workspace(self):
+
+        self.setDockNestingEnabled(True)
+
+        self.tabifyDockWidget(self.docks["object_tree"], self.docks["variables_viewer"])
+        self.tabifyDockWidget(
+            self.docks["object_tree"], self.docks["cq_object_inspector"]
+        )
+        self.tabifyDockWidget(self.docks["log"], self.docks["console"])
+        self.tabifyDockWidget(self.docks["log"], self.docks["traceback_viewer"])
+
+        self.docks["start"].raise_()
+        self.docks["object_tree"].raise_()
+        self.docks["log"].raise_()
+        self.docks["variables_viewer"].hide()
+        self.docks["cq_object_inspector"].hide()
+        self.docks["console"].hide()
+        self.docks["traceback_viewer"].hide()
+
+        self.resizeDocks(
+            [self.docks["editor"], self.docks["start"]],
+            [460, 220],
+            Qt.Vertical,
+        )
+        self.resizeDocks(
+            [
+                self.docks["traceback_viewer"],
+                self.docks["log"],
+                self.docks["console"],
+            ],
+            [320, 200, 140],
+            Qt.Vertical,
+        )
+
+    def handle_traceback(self, exc_info, code):
+
+        self.components["traceback_viewer"].addTraceback(exc_info, code)
+
+        if not exc_info:
+            self.docks["log"].raise_()
+            return
+
+        exc_type, exc_value, _tb = exc_info
+        self.docks["traceback_viewer"].show()
+        self.docks["traceback_viewer"].raise_()
+        self.resizeDocks(
+            [
+                self.docks["traceback_viewer"],
+                self.docks["log"],
+                self.docks["console"],
+            ],
+            [320, 180, 140],
+            Qt.Vertical,
+        )
+        self.update_statusbar(f"{exc_type.__name__}: {exc_value}")
+
+    def handle_render_state(self, state):
+
+        event = state.get("event")
+        mode = state.get("mode", "render")
+
+        if event == "start":
+            text = f"Rendering ({mode})..."
+        elif event == "node":
+            text = (
+                f"Rendering ({mode}) step {state.get('index', 0)}/"
+                f"{state.get('total_nodes', 0)}"
+            )
+        elif event == "fallback":
+            text = state.get("message", "Falling back to full render")
+        elif event == "finish":
+            text = (
+                f"Render done ({mode}) "
+                f"{state.get('exec_time_s', 0.0):.3f}s "
+                f"viewer {state.get('viewer_apply_time_s', 0.0):.4f}s"
+            )
+        elif event == "error":
+            text = f"{mode} failed: {state.get('message', 'unknown error')}"
+        else:
+            return
+
+        self.update_statusbar(text)
 
     def update_window_title(self, modified):
         """
