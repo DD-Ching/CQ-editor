@@ -96,6 +96,7 @@ show_object(result)
 
 def test_native_feature_audit_blocks_manual_pattern_script(panel):
     panel._last_prompt_text = "Create a symmetric bracket with a 2x2 bolt pattern."
+    panel.iterations_spin = DummyValue(3)
     script = """import cadquery as cq
 parts = []
 for x in (-20, -10, 0, 10, 20):
@@ -128,6 +129,20 @@ show_object(result)
 
     assert build_ok is False
     assert build_error
+
+
+def test_single_pass_audit_allows_simple_sphere(panel):
+    panel._last_prompt_text = "Draw a sphere."
+    script = """import cadquery as cq
+result = cq.Workplane("XY").sphere(10)
+show_object(result)
+"""
+
+    audit = panel._audit_script(script)
+    build_ok, build_error = panel._validate_script_build(script)
+
+    assert build_ok, build_error
+    assert audit["passed"] is True
 
 
 def test_sections_start_collapsed_and_can_expand():

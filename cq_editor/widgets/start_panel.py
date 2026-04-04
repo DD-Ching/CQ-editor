@@ -41,6 +41,7 @@ NATIVE_OP_WEIGHTS = {
     "rect": 1,
     "circle": 1,
     "cylinder": 1,
+    "sphere": 2,
     "extrude": 3,
     "revolve": 3,
     "loft": 3,
@@ -139,8 +140,8 @@ class StartPanel(QWidget, ComponentMixin):
         self.worker_effort = QComboBox(self)
         self.planner_effort.addItems(["xhigh", "high", "medium"])
         self.worker_effort.addItems(["high", "medium", "low"])
-        self.planner_effort.setCurrentText("xhigh")
-        self.worker_effort.setCurrentText("high")
+        self.planner_effort.setCurrentText("high")
+        self.worker_effort.setCurrentText("medium")
         self.controls_widget = QWidget(self)
         controls_row = QHBoxLayout(self.controls_widget)
         controls_row.setContentsMargins(0, 0, 0, 0)
@@ -1048,6 +1049,7 @@ class StartPanel(QWidget, ComponentMixin):
             "revolve",
             "loft",
             "sweep",
+            "sphere",
             "mirrorX",
             "mirrorY",
             "rarray",
@@ -1117,15 +1119,23 @@ class StartPanel(QWidget, ComponentMixin):
         requirements = self._intent_requirements(prompt_text)
         ops, warnings = self._inspect_script(script, prompt_text=prompt_text)
         blockers = []
+        strict_mode = self._review_stage_total() > 0
+        enforce_native_gate = (
+            requirements["mirror"] or requirements["pattern"] or weighted_manual >= 6
+        )
 
         if requirements["mirror"] and not any(op.startswith("mirror") for op in ops):
             blockers.append("Symmetry was requested but no mirror primitive was used.")
         if requirements["pattern"] and not any(op.startswith(prefix) for op in ops for prefix in ("rarray", "parray")):
             blockers.append("Patterned features were requested but no native array primitive was used.")
-        if native_score < 70:
+        if enforce_native_gate and native_score < 70:
             blockers.append(f"Native feature score {native_score}% is below the 70% gate.")
-        if not self._extract_script_header(script):
+        if strict_mode and not self._extract_script_header(script):
             blockers.append("PLAN/NATIVE_OPS/CHECKS header is required.")
+
+        if not strict_mode and blockers:
+            warnings.extend(blockers)
+            blockers = []
 
         return {
             "score": native_score,
@@ -1150,9 +1160,16 @@ class StartPanel(QWidget, ComponentMixin):
             return "high"
         return planner_effort
 
+    def _iterations_value(self):
+
+        try:
+            return int(self.iterations_spin.value())
+        except RuntimeError:
+            return 1
+
     def _review_stage_total(self):
 
-        return max(int(self.iterations_spin.value()) - 1, 0)
+        return max(self._iterations_value() - 1, 0)
 
     def _stage_title(self, stage):
 
