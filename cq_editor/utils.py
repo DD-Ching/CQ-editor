@@ -77,6 +77,12 @@ def dock(
 
     dock.setAllowedAreas(allowedAreas)
     dock.setWidget(widget)
+    dock.setMinimumWidth(120)
+    dock.setMinimumHeight(90)
+    if hasattr(widget, "setMinimumWidth"):
+        widget.setMinimumWidth(0)
+    if hasattr(widget, "setMinimumHeight"):
+        widget.setMinimumHeight(0)
     action = dock.toggleViewAction()
     action.setText(title)
 

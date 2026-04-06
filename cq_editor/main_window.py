@@ -558,6 +558,11 @@ class MainWindow(QMainWindow, MainMixin):
     def configure_workspace(self):
 
         self.setDockNestingEnabled(True)
+        self.setStyleSheet(
+            self.styleSheet()
+            + "\nQMainWindow::separator { width: 10px; height: 10px; background: rgba(90, 90, 90, 0.45); }"
+            + "\nQMainWindow::separator:hover { background: rgba(120, 160, 255, 0.7); }"
+        )
 
         self.tabifyDockWidget(self.docks["object_tree"], self.docks["variables_viewer"])
         self.tabifyDockWidget(
@@ -578,6 +583,11 @@ class MainWindow(QMainWindow, MainMixin):
             [self.docks["editor"], self.docks["start"]],
             [460, 220],
             Qt.Vertical,
+        )
+        self.resizeDocks(
+            [self.docks["editor"], self.docks["object_tree"]],
+            [760, 260],
+            Qt.Horizontal,
         )
         self.resizeDocks(
             [

@@ -23,6 +23,7 @@ from PyQt5.QtWidgets import (
     QSpinBox,
     QTreeWidget,
     QTreeWidgetItem,
+    QSizePolicy,
 )
 
 from ..icons import icon
@@ -125,6 +126,7 @@ class StartPanel(QWidget, ComponentMixin):
         self.progress.setTextVisible(True)
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.mode_combo = QComboBox(self)
         self.mode_combo.addItem("New", "new")
         self.mode_combo.addItem("Refine", "refine")
@@ -188,6 +190,19 @@ class StartPanel(QWidget, ComponentMixin):
         self.failure_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.failure_label.setStyleSheet("QLabel { color: #cc3b3b; }")
         self.failure_label.hide()
+        for label in (
+            self.title,
+            self.file_label,
+            self.cli_label,
+            self.hint_label,
+            self.check_label,
+            self.usage_label,
+            self.status_label,
+            self.detail_label,
+            self.failure_label,
+            self.elapsed_label,
+        ):
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self.workflow_widget = QWidget(self)
         layout(
