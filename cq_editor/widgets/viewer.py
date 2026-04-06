@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from PyQt5.QtWidgets import QWidget, QDialog, QTreeWidgetItem, QApplication, QAction
 
 from PyQt5.QtCore import pyqtSlot, pyqtSignal
@@ -329,6 +331,47 @@ class OCCViewer(QWidget, ComponentMixin):
     def fit(self):
 
         self.canvas.view.FitAll()
+
+    def _capture_view_state(self):
+
+        view = self._get_view()
+        return {
+            "eye": view.Eye(),
+            "at": view.At(),
+            "up": view.Up(),
+            "twist": view.Twist(),
+        }
+
+    def _restore_view_state(self, state):
+
+        if not state:
+            return
+
+        view = self._get_view()
+        view.SetEye(*state["eye"])
+        view.SetAt(*state["at"])
+        view.SetUp(*state["up"])
+        view.SetTwist(state["twist"])
+        self.redraw()
+
+    def capture_reference_views(self, output_dir, views=("front", "left", "top", "iso")):
+
+        state = self._capture_view_state()
+        dumped = {}
+
+        try:
+            for name in views:
+                getattr(self, f"{name}_view")()
+                self.fit()
+                self.redraw()
+                QApplication.processEvents()
+                path = str(Path(output_dir) / f"{name}.png")
+                self._get_view().Dump(path)
+                dumped[name] = path
+        finally:
+            self._restore_view_state(state)
+
+        return dumped
 
     def iso_view(self):
 

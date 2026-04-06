@@ -80,6 +80,8 @@ class StartPanel(QWidget, ComponentMixin):
         self._codex_path = shutil.which("codex")
         self._codex_process = None
         self._codex_output_path = None
+        self._codex_image_dir = None
+        self._codex_image_paths = {}
         self._codex_stdout = []
         self._codex_stdout_buffer = ""
         self._codex_stderr = []
@@ -136,6 +138,8 @@ class StartPanel(QWidget, ComponentMixin):
         self.iterations_spin.setValue(1)
         self.lean_tokens = QCheckBox("Lean tokens", self)
         self.lean_tokens.setChecked(True)
+        self.view_images = QCheckBox("View images", self)
+        self.view_images.setChecked(True)
         self.translate_button = QPushButton("中文", self)
         self.translate_button.setCheckable(True)
         self.planner_effort = QComboBox(self)
@@ -155,6 +159,7 @@ class StartPanel(QWidget, ComponentMixin):
         controls_row.addWidget(self.iterations_spin)
         controls_row.addStretch(1)
         controls_row.addWidget(self.lean_tokens)
+        controls_row.addWidget(self.view_images)
         controls_row.addWidget(self.translate_button)
         self.strategy_widget = QWidget(self)
         strategy_row = QHBoxLayout(self.strategy_widget)
@@ -359,6 +364,7 @@ class StartPanel(QWidget, ComponentMixin):
             ("Show", "顯示"),
             ("Hide", "收起"),
             ("Lean tokens", "節省 Token"),
+            ("View images", "多視角圖"),
             ("Task graph", "任務拓撲"),
             ("Rounds", "輪次"),
             ("Supervisor", "監督者"),
@@ -470,6 +476,48 @@ class StartPanel(QWidget, ComponentMixin):
 
         paths = self._context_paths()
         return ", ".join(path.name for path in paths) if paths else "none"
+
+    def _cleanup_codex_images(self):
+
+        image_dir = self._codex_image_dir
+        self._codex_image_dir = None
+        self._codex_image_paths = {}
+        if image_dir:
+            shutil.rmtree(image_dir, ignore_errors=True)
+
+    def _capture_view_images(self):
+
+        self._cleanup_codex_images()
+
+        if self.mode_combo.currentData() not in ("refine", "repair"):
+            return {}
+        if not self.view_images.isChecked():
+            return {}
+
+        viewer = self._main_window.components.get("viewer")
+        if viewer is None:
+            return {}
+
+        image_dir = tempfile.mkdtemp(prefix="cq_codex_views_")
+        try:
+            paths = viewer.capture_reference_views(image_dir)
+        except Exception as exc:
+            shutil.rmtree(image_dir, ignore_errors=True)
+            warning(f"View capture failed: {exc}")
+            return {}
+
+        existing = {
+            name: path
+            for name, path in paths.items()
+            if path and Path(path).exists() and Path(path).stat().st_size > 0
+        }
+        if not existing:
+            shutil.rmtree(image_dir, ignore_errors=True)
+            return {}
+
+        self._codex_image_dir = image_dir
+        self._codex_image_paths = existing
+        return existing
 
     def _load_context_blocks(self, max_chars=4000):
 
@@ -671,6 +719,7 @@ class StartPanel(QWidget, ComponentMixin):
         self.planner_label.setText(self._translate_text("Effort"))
         self.worker_label.setText(self._translate_text("Workers"))
         self.lean_tokens.setText(self._translate_text("Lean tokens"))
+        self.view_images.setText(self._translate_text("View images"))
         self.translate_button.setText("EN" if self._is_zh() else "中文")
         self.new_button.setText(self._translate_text("New Script"))
         self.open_button.setText(self._translate_text("Open Script"))
@@ -950,6 +999,18 @@ class StartPanel(QWidget, ComponentMixin):
         if mode == "repair" and self._last_traceback_text:
             prompt_lines.extend(("Current error to fix:", self._last_traceback_text))
 
+        if self._codex_image_paths:
+            prompt_lines.extend(
+                (
+                    "",
+                    "Attached images show the current model from these views: "
+                    + ", ".join(self._codex_image_paths.keys())
+                    + ".",
+                    "Use the images to judge proportion, symmetry, topology, and obvious visual defects.",
+                    "Prefer the smallest viable script edits that improve the shown model.",
+                )
+            )
+
         return "\n".join(prompt_lines)
 
     def _set_generating(self, running):
@@ -964,6 +1025,7 @@ class StartPanel(QWidget, ComponentMixin):
         self.planner_effort.setEnabled(not running)
         self.worker_effort.setEnabled(not running)
         self.lean_tokens.setEnabled(not running)
+        self.view_images.setEnabled(not running)
         self.translate_button.setEnabled(not running)
 
     def _codex_timeout_ms(self):
@@ -975,6 +1037,8 @@ class StartPanel(QWidget, ComponentMixin):
             base += 45000
         elif effort == "xhigh":
             base += 90000
+        if self._codex_image_paths:
+            base += 45000
         return base
 
     def _restart_codex_timeout(self):
@@ -1302,6 +1366,7 @@ class StartPanel(QWidget, ComponentMixin):
         active_stage = self._active_stage
         stage_text = self._stage_title(active_stage) if active_stage is not None else "No active stage"
         self._cleanup_output_path()
+        self._cleanup_codex_images()
         self._codex_process = None
         self._pipeline_queue = []
         if active_stage is not None:
@@ -1328,34 +1393,40 @@ class StartPanel(QWidget, ComponentMixin):
         fd, output_path = tempfile.mkstemp(prefix="cq_codex_", suffix=".py")
         os.close(fd)
         self._codex_output_path = output_path
+        image_paths = self._capture_view_images()
         prompt_text = self._build_stage_prompt(stage, script=self._pipeline_script)
+        args = [
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--json",
+            "--color",
+            "never",
+            "-c",
+            f'reasoning_effort="{stage["effort"]}"',
+            "-C",
+            str(
+                Path(self._main_window.components["editor"].filename).resolve().parent
+                if self._main_window.components["editor"].filename
+                else Path.cwd()
+            ),
+        ]
+        for path in image_paths.values():
+            args.extend(["-i", path])
+        args.extend(
+            [
+                "-o",
+                output_path,
+                prompt_text,
+            ]
+        )
         process = QProcess(self)
         process.started.connect(process.closeWriteChannel)
         process.readyReadStandardOutput.connect(self._read_codex_stdout)
         process.readyReadStandardError.connect(self._read_codex_stderr)
         process.finished.connect(self._codex_finished)
         process.setProgram(self._codex_path)
-        process.setArguments(
-            [
-                "exec",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--json",
-                "--color",
-                "never",
-                "-c",
-                f'reasoning_effort="{stage["effort"]}"',
-                "-C",
-                str(
-                    Path(self._main_window.components["editor"].filename).resolve().parent
-                    if self._main_window.components["editor"].filename
-                    else Path.cwd()
-                ),
-                "-o",
-                output_path,
-                prompt_text,
-            ]
-        )
+        process.setArguments(args)
 
         self._active_stage = stage
         self._codex_process = process
@@ -1366,6 +1437,8 @@ class StartPanel(QWidget, ComponentMixin):
         self._codex_abort_reason = None
         self._set_task_status(stage["task_id"], "running")
         self._add_history_line(f"Stage: {self._stage_title(stage)}")
+        if image_paths:
+            self._add_history_line("Views: " + ", ".join(image_paths.keys()))
         self._begin_activity("Codex", "Generating with Codex", self._stage_title(stage), busy=True)
         self._set_text(
             "cli_label",
@@ -1628,6 +1701,7 @@ class StartPanel(QWidget, ComponentMixin):
             "cached_input_tokens": 0,
             "output_tokens": 0,
         }
+        self._cleanup_codex_images()
         self._last_prompt_text = prompt_text
         self._start_history_entry()
         self._add_history_line(f"Context: {self._context_summary()}")
@@ -1693,6 +1767,7 @@ class StartPanel(QWidget, ComponentMixin):
             Path(output_path).read_text(encoding="utf-8")
         )
         Path(output_path).unlink()
+        self._cleanup_codex_images()
         self._codex_process = None
         if not generated:
             self._fail_pipeline("Codex returned an empty script.")

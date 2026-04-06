@@ -1,5 +1,6 @@
 import pytest
 from types import SimpleNamespace
+from pathlib import Path
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTreeWidgetItem
 
@@ -8,6 +9,28 @@ from cq_editor.widgets.start_panel import StartPanel
 
 class DummySignal:
     def connect(self, *_args, **_kwargs):
+        pass
+
+
+class DummyProcess:
+    def __init__(self, *_args, **_kwargs):
+        self.started = DummySignal()
+        self.readyReadStandardOutput = DummySignal()
+        self.readyReadStandardError = DummySignal()
+        self.finished = DummySignal()
+        self.program = None
+        self.arguments = None
+
+    def setProgram(self, program):
+        self.program = program
+
+    def setArguments(self, arguments):
+        self.arguments = arguments
+
+    def closeWriteChannel(self):
+        pass
+
+    def start(self):
         pass
 
 
@@ -39,10 +62,28 @@ class DummyDebugger:
         pass
 
 
+class DummyViewer:
+    def __init__(self):
+        self.calls = []
+
+    def capture_reference_views(self, output_dir, views=("front", "left", "top", "iso")):
+        self.calls.append((output_dir, tuple(views)))
+        dumped = {}
+        for name in views:
+            path = Path(output_dir) / f"{name}.png"
+            path.write_bytes(b"png")
+            dumped[name] = str(path)
+        return dumped
+
+
 class DummyMain(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.components = {"editor": DummyEditor(), "debugger": DummyDebugger()}
+        self.components = {
+            "editor": DummyEditor(),
+            "debugger": DummyDebugger(),
+            "viewer": DummyViewer(),
+        }
 
 
 class DummyValue:
@@ -312,3 +353,59 @@ def test_build_stage_prompt_uses_single_cli_prompt(panel):
     assert 'cq.Workplane("XY").circle(r)' in prompt
     assert "reasoning effort high" in prompt
     assert "User request: Draw a gear." in prompt
+
+
+def test_capture_view_images_attaches_reference_views_for_refine():
+    app = QApplication.instance() or QApplication([])
+    main = DummyMain()
+    panel = StartPanel(main)
+    panel.mode_combo.setCurrentIndex(panel.mode_combo.findData("refine"))
+
+    images = panel._capture_view_images()
+
+    assert tuple(images.keys()) == ("front", "left", "top", "iso")
+    assert panel._main_window.components["viewer"].calls
+    panel._cleanup_codex_images()
+
+
+def test_build_stage_prompt_mentions_attached_views(panel):
+    panel.prompt = DummyValue("Refine this bicycle.")
+    panel.mode_combo = DummyValue("refine")
+    panel.planner_effort = DummyValue("high")
+    panel.lean_tokens = SimpleNamespace(isChecked=lambda: True)
+    panel._codex_image_paths = {
+        "front": "/tmp/front.png",
+        "left": "/tmp/left.png",
+        "top": "/tmp/top.png",
+        "iso": "/tmp/iso.png",
+    }
+
+    prompt = panel._build_stage_prompt({"task_id": "codex", "kind": "refine", "effort": "high"})
+
+    assert "Attached images show the current model from these views" in prompt
+    assert "front, left, top, iso" in prompt
+
+
+def test_launch_stage_passes_images_to_codex(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    main = DummyMain()
+    panel = StartPanel(main)
+    panel._codex_path = "codex"
+    panel._main_window.components["editor"].filename = "/Users/ddh/Downloads/CAnend/worktrees/cadquery-runtime/examples/incremental/viewer_diff_plate.py"
+    stage = {"task_id": "codex", "kind": "refine", "effort": "high"}
+
+    monkeypatch.setattr("cq_editor.widgets.start_panel.QProcess", DummyProcess)
+    monkeypatch.setattr(
+        panel,
+        "_capture_view_images",
+        lambda: {
+            "front": "/tmp/front.png",
+            "left": "/tmp/left.png",
+        },
+    )
+
+    panel._launch_stage(stage)
+
+    assert panel._codex_process.arguments.count("-i") == 2
+    assert "/tmp/front.png" in panel._codex_process.arguments
+    assert "/tmp/left.png" in panel._codex_process.arguments
