@@ -312,6 +312,15 @@ class MainWindow(QMainWindow, MainMixin):
         for t in self.findChildren(QToolBar):
             menu_view.addAction(t.toggleViewAction())
 
+        menu_view.addSeparator()
+        self.reset_layout_action = QAction(
+            "Reset Layout",
+            self,
+            shortcut="Ctrl+Shift+0",
+            triggered=self.reset_layout,
+        )
+        menu_view.addAction(self.reset_layout_action)
+
         self.toggle_comment_action = QAction(
             icon("toggle-comment"),
             "Toggle Comment",
@@ -555,6 +564,18 @@ class MainWindow(QMainWindow, MainMixin):
         new_title = fname if fname else "*"
         self.setWindowTitle(f"{self.name}: {new_title}")
 
+    def reset_layout(self):
+
+        self.settings.remove("geometry")
+        self.settings.remove("windowState")
+
+        for dock in self.docks.values():
+            dock.setFloating(False)
+
+        self.configure_workspace()
+        self.saveWindow()
+        self.update_statusbar("Layout reset")
+
     def configure_workspace(self):
 
         self.setDockNestingEnabled(True)
@@ -571,6 +592,12 @@ class MainWindow(QMainWindow, MainMixin):
         self.tabifyDockWidget(self.docks["log"], self.docks["console"])
         self.tabifyDockWidget(self.docks["log"], self.docks["traceback_viewer"])
 
+        self.docks["editor"].show()
+        self.docks["start"].show()
+        self.docks["object_tree"].show()
+        self.docks["log"].show()
+
+        self.docks["editor"].raise_()
         self.docks["start"].raise_()
         self.docks["object_tree"].raise_()
         self.docks["log"].raise_()

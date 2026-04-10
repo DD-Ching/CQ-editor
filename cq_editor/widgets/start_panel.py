@@ -82,6 +82,8 @@ class StartPanel(QWidget, ComponentMixin):
         self._codex_output_path = None
         self._codex_image_dir = None
         self._codex_image_paths = {}
+        self._codex_target_file = None
+        self._codex_target_is_managed = False
         self._codex_stdout = []
         self._codex_stdout_buffer = ""
         self._codex_stderr = []
@@ -477,6 +479,40 @@ class StartPanel(QWidget, ComponentMixin):
         paths = self._context_paths()
         return ", ".join(path.name for path in paths) if paths else "none"
 
+    def _codex_workspace_dir(self):
+
+        editor = self._main_window.components.get("editor")
+        if editor is not None and getattr(editor, "filename", ""):
+            return Path(editor.filename).resolve().parent
+        return self._workspace_root()
+
+    def _managed_target_dir(self):
+
+        target_dir = self._workspace_root() / ".cq_editor_codex"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        return target_dir
+
+    def _prepare_codex_target_file(self):
+
+        editor = self._main_window.components["editor"]
+        text = editor.toPlainText()
+        if not text.strip():
+            text = STARTER_SCRIPT
+        if not text.endswith("\n"):
+            text += "\n"
+
+        if editor.filename:
+            target = Path(editor.filename).resolve()
+            managed = False
+        else:
+            target = self._managed_target_dir() / "current_script.py"
+            managed = True
+
+        target.write_text(text, encoding="utf-8", newline="\n")
+        self._codex_target_file = str(target)
+        self._codex_target_is_managed = managed
+        return target
+
     def _cleanup_codex_images(self):
 
         image_dir = self._codex_image_dir
@@ -541,7 +577,9 @@ class StartPanel(QWidget, ComponentMixin):
         filtered = [
             line
             for line in stderr_lines
-            if "shell_snapshot" not in line and "plugins::manager" not in line
+            if "shell_snapshot" not in line
+            and "plugins::manager" not in line
+            and "Reading additional input from stdin" not in line
         ]
         lines.extend(filtered[-limit:])
         return lines[-limit:]
@@ -557,7 +595,7 @@ class StartPanel(QWidget, ComponentMixin):
         ]
         if timed_out:
             lines.append(
-                "Next: Try Iterations = 1 first, or lower Workers/Planner effort before retrying."
+                "Next: Try Iterations = 1 first, or lower the single Effort setting before retrying."
             )
         elif stopped:
             lines.append("Next: Retry when you are ready. No new script was applied.")
@@ -946,24 +984,27 @@ class StartPanel(QWidget, ComponentMixin):
     def _build_codex_prompt(self):
 
         request = self.prompt.toPlainText().strip()
-        current_script = self._compact_script_context(
-            self._main_window.components["editor"].toPlainText().strip()
-        )
         mode = self.mode_combo.currentData()
         effort = self.planner_effort.currentText()
         context_block = self._load_context_blocks()
+        target_file = self._codex_target_file or str(self._prepare_codex_target_file())
         prompt_lines = [
-            "Write one CadQuery Python script for CQ-editor.",
-            "Return only raw Python code with no markdown fences or explanation.",
+            "Open and edit one CadQuery Python file for CQ-editor.",
+            f"Target file: {target_file}",
+            "Read the existing file, modify it in place, and save it back to the same path.",
+            "Do not create alternate scripts unless absolutely necessary.",
+            "Keep the file valid for CQ-editor.",
             "Use import cadquery as cq.",
             "Assign the final shape to result and call show_object(result).",
+            "Use local file inspection or lightweight validation commands when helpful, but keep the workflow focused on the target file.",
             'For simple primitives, prefer direct Workplane primitives such as cq.Workplane("XY").circle(r), sphere(r), box(x, y, z), or cylinder(h, r).',
             "Prefer native CadQuery operations where applicable: extrude, revolve, loft, sweep, union, cut, hole, fillet, chamfer, mirrorX, mirrorY, rarray, parray.",
             "Avoid manually recreating repeated or symmetric geometry when a native mirror or pattern tool fits.",
             "At least 70% of repeated, symmetric, or patterned geometry must rely on native CadQuery feature operations instead of one-by-one placement.",
             "If symmetry is requested, use mirrorX or mirrorY unless there is a concrete reason not to.",
             "If a hole pattern or repeated feature is requested, use rarray or parray unless there is a concrete reason not to.",
-            f"Use reasoning effort {effort}, but produce one final script in one pass.",
+            f"Use reasoning effort {effort}, edit the target file, then stop.",
+            "After editing, reply with a short plain-text summary of what changed and any remaining risk.",
             "Add short PLAN:, NATIVE_OPS:, and CHECKS: comments when practical, but do not block yourself on formatting.",
         ]
 
@@ -979,22 +1020,17 @@ class StartPanel(QWidget, ComponentMixin):
             prompt_lines.extend(("Local agent context:", context_block, ""))
 
         if mode == "new":
-            prompt_lines.append("Create a new model from scratch.")
+            prompt_lines.append("Create a new model in the target file from scratch.")
         elif mode == "refine":
             prompt_lines.append(
-                "Refine the current CadQuery script instead of rewriting it from scratch."
+                "Refine the current target file instead of rewriting unrelated parts."
             )
         else:
             prompt_lines.append(
-                "Repair the current CadQuery script with the smallest viable changes."
+                "Repair the current target file with the smallest viable changes."
             )
 
         prompt_lines.extend((f"User request: {request}", ""))
-
-        if mode in ("refine", "repair"):
-            prompt_lines.extend(
-                ("Current script for context:", current_script or "# none", "")
-            )
 
         if mode == "repair" and self._last_traceback_text:
             prompt_lines.extend(("Current error to fix:", self._last_traceback_text))
@@ -1030,20 +1066,27 @@ class StartPanel(QWidget, ComponentMixin):
 
     def _codex_timeout_ms(self):
 
-        base = 120000 if self.lean_tokens.isChecked() else 180000
+        base = 900000 if self.lean_tokens.isChecked() else 1200000
         stage = self._active_stage or {}
         effort = stage.get("effort")
         if effort == "high":
-            base += 45000
+            base += 300000
         elif effort == "xhigh":
-            base += 90000
+            base += 600000
         if self._codex_image_paths:
-            base += 45000
+            base += 180000
         return base
+
+    def _codex_timeout_enabled(self):
+
+        return False
 
     def _restart_codex_timeout(self):
 
         if self._codex_process is None:
+            return
+        self._codex_timeout_timer.stop()
+        if not self._codex_timeout_enabled():
             return
         self._codex_timeout_timer.start(self._codex_timeout_ms())
 
@@ -1062,7 +1105,7 @@ class StartPanel(QWidget, ComponentMixin):
     def _handle_codex_timeout(self):
 
         self._abort_codex_generation(
-            f"Generation timed out after {self._codex_timeout_ms() / 1000:.0f}s.",
+            f"Generation timed out after {self._codex_timeout_ms() / 1000:.0f}s with no completion.",
             kind="timeout",
         )
 
@@ -1178,7 +1221,7 @@ class StartPanel(QWidget, ComponentMixin):
             QTreeWidgetItem(
                 [
                     self._history_text(
-                        f"Strategy: single cli · effort {self.planner_effort.currentText()}"
+                        f"Strategy: single cli · file edit · effort {self.planner_effort.currentText()}"
                     )
                 ]
             )
@@ -1390,7 +1433,7 @@ class StartPanel(QWidget, ComponentMixin):
 
     def _launch_stage(self, stage):
 
-        fd, output_path = tempfile.mkstemp(prefix="cq_codex_", suffix=".py")
+        fd, output_path = tempfile.mkstemp(prefix="cq_codex_", suffix=".txt")
         os.close(fd)
         self._codex_output_path = output_path
         image_paths = self._capture_view_images()
@@ -1398,6 +1441,7 @@ class StartPanel(QWidget, ComponentMixin):
         args = [
             "exec",
             "--skip-git-repo-check",
+            "--full-auto",
             "--ephemeral",
             "--json",
             "--color",
@@ -1405,11 +1449,7 @@ class StartPanel(QWidget, ComponentMixin):
             "-c",
             f'reasoning_effort="{stage["effort"]}"',
             "-C",
-            str(
-                Path(self._main_window.components["editor"].filename).resolve().parent
-                if self._main_window.components["editor"].filename
-                else Path.cwd()
-            ),
+            str(self._workspace_root()),
         ]
         for path in image_paths.values():
             args.extend(["-i", path])
@@ -1684,7 +1724,13 @@ class StartPanel(QWidget, ComponentMixin):
             return
 
         editor = self._main_window.components["editor"]
-        if not skip_confirm and not editor.confirm_discard():
+        if (
+            not skip_confirm
+            and self.mode_combo.currentData() == "new"
+            and editor.modified
+            and editor.toPlainText().strip()
+            and not editor.confirm_discard()
+        ):
             return
 
         if auto_mode:
@@ -1702,9 +1748,12 @@ class StartPanel(QWidget, ComponentMixin):
             "output_tokens": 0,
         }
         self._cleanup_codex_images()
+        self._prepare_codex_target_file()
         self._last_prompt_text = prompt_text
         self._start_history_entry()
         self._add_history_line(f"Context: {self._context_summary()}")
+        if self._codex_target_file:
+            self._add_history_line(f"Target file: {self._codex_target_file}")
         self._set_section_visible("workflow", True)
         self._set_task_status("codex", "running")
         self._set_task_status("renderer", "waiting")
@@ -1759,23 +1808,30 @@ class StartPanel(QWidget, ComponentMixin):
             self._fail_pipeline(error_text)
             return
 
-        if not output_path or not Path(output_path).exists():
-            self._fail_pipeline("Codex did not produce an output file.")
+        summary_text = ""
+        if output_path and Path(output_path).exists():
+            summary_text = Path(output_path).read_text(encoding="utf-8", errors="ignore").strip()
+            Path(output_path).unlink()
+
+        target_file = self._codex_target_file
+        if not target_file or not Path(target_file).exists():
+            self._fail_pipeline("Codex did not update the target file.")
             return
 
         generated = self._normalize_generated_script(
-            Path(output_path).read_text(encoding="utf-8")
+            Path(target_file).read_text(encoding="utf-8")
         )
-        Path(output_path).unlink()
         self._cleanup_codex_images()
         self._codex_process = None
         if not generated:
-            self._fail_pipeline("Codex returned an empty script.")
+            self._fail_pipeline("Codex left the target file empty.")
             return
 
         if active_stage is not None:
             self._set_task_status(active_stage["task_id"], "done")
             self._add_history_line(f"Result: {self._stage_title(active_stage)} ready")
+        if summary_text:
+            self._add_history_line("Codex: " + " ".join(summary_text.splitlines())[:200])
 
         self._pipeline_script = generated
 
@@ -1811,10 +1867,12 @@ class StartPanel(QWidget, ComponentMixin):
 
         editor = self._main_window.components["editor"]
         editor.set_text(generated + "\n")
+        if self._codex_target_is_managed and not editor.filename:
+            editor.filename = target_file
         editor.reset_modified()
-        ready_detail = "script inserted into editor"
+        ready_detail = "file updated and loaded into editor"
         if not build_ok:
-            ready_detail = "script inserted into editor; render may fail"
+            ready_detail = "file updated and loaded into editor; render may fail"
         self._finish_activity("Codex ready", ready_detail)
         self._finish_history_entry("Ready", ready_detail)
         self.prompt.clear()

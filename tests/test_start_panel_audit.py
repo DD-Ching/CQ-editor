@@ -37,6 +37,7 @@ class DummyProcess:
 class DummyEditor:
     filename = ""
     sigFilenameChanged = DummySignal()
+    modified = False
 
     def confirm_discard(self):
         return True
@@ -303,14 +304,12 @@ def test_refresh_cli_status_reports_login_and_smoke(monkeypatch):
     assert "exec ok" in panel.check_label.text()
 
 
-def test_codex_timeout_scales_with_effort():
+def test_codex_timeout_is_disabled_for_interactive_runs():
     app = QApplication.instance() or QApplication([])
     main = DummyMain()
     panel = StartPanel(main)
-    panel.lean_tokens.setChecked(True)
-    panel._active_stage = {"effort": "xhigh"}
 
-    assert panel._codex_timeout_ms() == 210000
+    assert panel._codex_timeout_enabled() is False
 
 
 def test_stage_plan_uses_single_codex_pass_by_default(panel):
@@ -341,6 +340,7 @@ def test_build_stage_prompt_uses_single_cli_prompt(panel):
     panel.mode_combo = DummyValue("new")
     panel.planner_effort = DummyValue("high")
     panel.lean_tokens = SimpleNamespace(isChecked=lambda: True)
+    panel._codex_target_file = "/tmp/current_script.py"
     stage = {
         "task_id": "codex",
         "kind": "new",
@@ -349,7 +349,8 @@ def test_build_stage_prompt_uses_single_cli_prompt(panel):
 
     prompt = panel._build_stage_prompt(stage, "")
 
-    assert "Write one CadQuery Python script for CQ-editor." in prompt
+    assert "Open and edit one CadQuery Python file for CQ-editor." in prompt
+    assert "Target file: /tmp/current_script.py" in prompt
     assert 'cq.Workplane("XY").circle(r)' in prompt
     assert "reasoning effort high" in prompt
     assert "User request: Draw a gear." in prompt
@@ -373,6 +374,7 @@ def test_build_stage_prompt_mentions_attached_views(panel):
     panel.mode_combo = DummyValue("refine")
     panel.planner_effort = DummyValue("high")
     panel.lean_tokens = SimpleNamespace(isChecked=lambda: True)
+    panel._codex_target_file = "/tmp/current_script.py"
     panel._codex_image_paths = {
         "front": "/tmp/front.png",
         "left": "/tmp/left.png",
@@ -406,6 +408,18 @@ def test_launch_stage_passes_images_to_codex(monkeypatch):
 
     panel._launch_stage(stage)
 
+    assert "--full-auto" in panel._codex_process.arguments
     assert panel._codex_process.arguments.count("-i") == 2
     assert "/tmp/front.png" in panel._codex_process.arguments
     assert "/tmp/left.png" in panel._codex_process.arguments
+
+
+def test_prepare_codex_target_file_writes_managed_script_for_untitled(panel):
+    panel._main_window.components["editor"].set_text('import cadquery as cq\nshow_object(result)\n')
+
+    target = panel._prepare_codex_target_file()
+
+    assert target.name == "current_script.py"
+    assert target.exists()
+    assert panel._codex_target_is_managed is True
+    assert target.read_text(encoding="utf-8").startswith("import cadquery as cq")
